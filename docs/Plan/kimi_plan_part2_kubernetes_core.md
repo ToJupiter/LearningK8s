@@ -13,7 +13,7 @@ Instead of managing individual containers, you declare a **stack** of services:
 
 ```yaml
 # 01-two-tier-app/docker-compose.yml
-version: "3.9"
+# NOTE: no `version:` key — Compose v2 ignores it (and warns). Old tutorials still show `version: "3.9"`.
 
 services:
   db:
@@ -71,6 +71,8 @@ networks:
   frontend:
     driver: bridge
 ```
+
+> ⚠ `deploy` semantics under plain `docker compose up` (verified, Compose v2): `deploy.resources.limits` (memory/cpus) **are** applied — confirm with `docker stats` showing the LIMIT column; `deploy.resources.reservations` may be silently ignored; `deploy.replicas` is **always** ignored outside Swarm (see 4.3 note). Old `docker-compose` v1 ignored the whole `deploy` block with a warning. When a limit "doesn't work", first check which Compose binary you ran (`docker compose version` vs `docker-compose --version`).
 
 **Key Concepts You're Learning for Kubernetes:**
 - **Services** with names resolve via DNS (`db`, `api`, `web`)
@@ -447,13 +449,44 @@ spec:
       labels:
         app: node-exporter
     spec:
-      hostNetwork: true     # Access host network metrics
+      hostNetwork: true
+      hostPID: true            # see the HOST's processes, not the container's
+      tolerations:
+        - operator: Exists     # run even on tainted nodes (e.g. control-plane)
       containers:
         - name: node-exporter
-          image: prom/node-exporter:latest
+          image: prom/node-exporter:v1.8.2   # pin it — :latest breaks reproducibility (see Part 5 A1)
+          args:
+            - --path.procfs=/host/proc   # WITHOUT these three flags + mounts below,
+            - --path.sysfs=/host/sys     # node-exporter reports the CONTAINER's
+            - --path.rootfs=/host/root   # /proc and /sys — a useless "node" monitor
           ports:
             - containerPort: 9100
+              hostPort: 9100
+              name: metrics
+          volumeMounts:
+            - name: proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: sys
+              mountPath: /host/sys
+              readOnly: true
+            - name: root
+              mountPath: /host/root
+              mountPropagation: HostToContainer
+              readOnly: true
+      volumes:
+        - name: proc
+          hostPath:
+            path: /proc
+        - name: sys
+          hostPath:
+            path: /sys
+        - name: root
+          hostPath:
+            path: /
 ```
+Verify it reports the node, not the pod: `curl <node-ip>:9100/metrics | grep node_uname_info` should show the host kernel, and `node_filesystem_*` should list host mounts.
 
 ### 7.3 Jobs and CronJobs
 
@@ -521,10 +554,12 @@ spec:
           averageUtilization: 80
 ```
 
-**Note:** HPA requires Metrics Server. Install it on K3s:
+**Note:** HPA requires Metrics Server — but **check before you install: K3s already bundles it.**
 ```bash
-kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
-# For K3s/WSL, you may need to add --kubelet-insecure-tls flag
+kubectl get deploy -n kube-system metrics-server   # present on default K3s → kubectl top already works
+# Only if you installed K3s with --disable=metrics-server, reinstall upstream and
+# patch the deployment args with --kubelet-insecure-tls (kubelet serving certs are k3s-CA-signed):
+# kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
 ```
 
 ---
@@ -569,7 +604,21 @@ spec:
                   number: 80
 ```
 
-On WSL, access via `http://api.localdev.me` from Windows browser (since `localdev.me` resolves to 127.0.0.1).
+On WSL, `api.localdev.me` resolves to 127.0.0.1 — but nothing listens on port 80 yet: the `baremetal` manifest exposes the controller as a **NodePort** Service (30000+ range), so a plain `http://api.localdev.me` gets connection refused. Two ways in:
+
+```bash
+# Option A — lab path: forward host port 80 straight at the controller Service
+kubectl port-forward -n ingress-nginx svc/ingress-nginx-controller 8080:80 &
+curl -H 'Host: api.localdev.me' localhost:8080   # then http://api.localdev.me:8080 from Windows
+```
+
+```bash
+# Option B — prod-feel path: let K3s's Klipper-lb (still enabled — only Traefik was disabled)
+# bind real host ports 80/443 by flipping the controller Service to LoadBalancer
+kubectl -n ingress-nginx patch svc ingress-nginx-controller -p '{"spec":{"type":"LoadBalancer"}}'
+kubectl -n ingress-nginx get svc ingress-nginx-controller -w  # wait for EXTERNAL-IP (your node IP)
+# now http://api.localdev.me works on port 80 from the Windows browser
+```
 
 ### 8.2 Persistent Volumes & Claims
 
@@ -672,7 +721,7 @@ kubectl get rs -l app=api                           # old ReplicaSets ARE your h
 ```
 Understand the mechanism: a Deployment revision **is** a ReplicaSet; rollback = re-pointing the selector; `revisionHistoryLimit: 3` caps the pile. Read `ownerReferences` in `kubectl get rs -o yaml` — your first taste of Kubernetes garbage collection (Deployments own ReplicaSets own Pods).
 
-**A5. The empty-Endpoints disease.** 502 from Ingress → `kubectl get endpoints api-service` shows `<none>` → selector/label mismatch (typo, wrong namespace). Crucial insight the plan never states: **a Service VIP exists and accepts connections even with zero backends** — which is why the failure is a 502/timeout, not "unknown host". Memorize this diagnostic chain; you will use it weekly.
+**A5. The empty-Endpoints disease.** 502 from Ingress → `kubectl get endpoints api-service` shows `<none>` → selector/label mismatch (typo, wrong namespace). Crucial insight the plan never states: **a Service name still resolves and its VIP still exists even with zero backends** — kube-proxy programs a REJECT for the empty endpoint set, so the failure surfaces as a fast refusal / 502 / timeout, not "unknown host". That signature is what points you at Endpoints instead of DNS. Memorize this diagnostic chain; you will use it weekly.
 
 **A6. DNS rules you will use daily.** Resolution ladder: `postgres` (same namespace) → `postgres.production` → `postgres.production.svc` → FQDN `postgres.production.svc.cluster.local`. Why FQDN matters: pods get `ndots:5` in resolv.conf, so single-label names walk every search domain first — extra queries, slower failures, subtle perf cost. Cross-namespace always uses the namespace-qualified form. Verify from inside: `kubectl run -it --rm --image=busybox -- nslookup postgres.production.svc.cluster.local`.
 

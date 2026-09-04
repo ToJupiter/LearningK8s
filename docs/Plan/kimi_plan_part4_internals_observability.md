@@ -47,13 +47,14 @@ cat /sys/fs/cgroup/system.slice/docker-*/memory.max        # v2: 268435456
 cat /sys/fs/cgroup/system.slice/docker-*/cpu.max           # v2: 50000 100000
 docker stats cg --no-stream
 
-# OOM lab (must experience once):
-docker run --rm --memory=50m alpine sh -c 'apk add -q stress; stress --vm 1 --vm-bytes 100M'
-docker inspect cg --format '{{.State.OOMKilled}}'
+# OOM lab (must experience once — note: NO --rm, or the evidence deletes itself):
+docker run --name oomvic --memory=50m alpine sh -c 'apk add -q stress; stress --vm 1 --vm-bytes 100M'; echo "exit=$?"
+docker inspect oomvic --format 'OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}}'  # expect true / 137
+docker rm oomvic
 dmesg | grep -i oom
 ```
 
-K8s mapping: `requests.memory` -> `memory.min` reservation hint for scheduler; `limits.memory` -> `memory.max` hard cgroup cap. CPU `100m` = 0.1 core = `cpu.weight` share, throttled not killed.
+K8s mapping (defaults — check `kubectl version` before assuming; this area changed recently): `requests.memory` is scheduler + QoS/eviction input ONLY — the kernel never sees it. `limits.memory` -> `memory.max` hard cgroup cap. (`requests` -> `memory.min`/`memory.low` protection exists ONLY with the MemoryQoS feature gate: opt-in `TieredReservation` on ≤1.36, beta default-on from 1.37.) CPU `100m` = 0.1 core = `cpu.weight` share, throttled not killed.
 
 ### 12.3 OverlayFS, Storage Drivers, Copy-on-Write
 
@@ -131,7 +132,7 @@ Lint with Hadolint, scan with `docker scout`, `trivy image`, `grype`. Sign with 
 
 1. **Capabilities:** Docker drops most Linux caps by default. `--cap-add=NET_ADMIN` vs `--privileged` (gives all + devices — never in prod).
    `capsh --print`, `docker inspect --format '{{.HostConfig.CapAdd}}'`.
-2. **Seccomp/AppArmor:** `docker run --security-opt seccomp=unconfined`, `--security-opt apparmor=...`. Default profiles block 300+ syscalls.
+2. **Seccomp/AppArmor:** `docker run --security-opt seccomp=unconfined`, `--security-opt apparmor=...`. The default profile blocks ~44 of 300+ syscalls (Docker docs, verbatim) — an allowlist for least privilege, not a sandbox.
 3. **Read-only + no-new-privs:**
    ```bash
    docker run --read-only --tmpfs /tmp --tmpfs /run -u 65532 nginx:alpine
@@ -176,10 +177,12 @@ kubectl get pods -A  # coredns, local-path-provisioner, metrics-server, traefik 
 | External Postgres/MySQL | `--datastore-endpoint postgres://...` | Central DB team, existing backup story. Kine translates. |
 
 ```bash
-# Backup/restore SQLite single-node:
-sudo k3s etcd-snapshot save --help  # works even on SQLite via kine snapshot abstraction
-sudo cp /var/lib/rancher/k3s/server/db/state.db /backup/
-# HA etcd snapshot:
+# Backup SQLite single-node (k3s etcd-snapshot does NOT work here — etcd-only):
+# hot, consistent copy WITHOUT stopping k3s:
+sudo sqlite3 /var/lib/rancher/k3s/server/db/state.db ".backup '/backup/k3s-state.db'"
+# or cold copy (stop first): sudo systemctl stop k3s && sudo cp /var/lib/rancher/k3s/server/db/state.db /backup/ && sudo systemctl start k3s
+# Restore SQLite: stop k3s, copy the backup back over state.db (fix ownership), start k3s.
+# HA embedded-etcd snapshot (only with --cluster-init):
 sudo k3s etcd-snapshot save /tmp/snap.db
 sudo k3s etcd-snapshot restore /tmp/snap.db
 ```
@@ -199,7 +202,7 @@ kubectl -n kube-system logs -l app=flannel
 # Change: --flannel-backend=wireguard-native
 ```
 
-Flannel limitations: no NetworkPolicy enforcement! For policy need Calico/Cilium as replacement (`--flannel-backend=none --disable-network-policy` + install Cilium). Know this tradeoff.
+Flannel itself enforces no policy — but default K3s ALSO runs an embedded kube-router NetworkPolicy controller, so standard NetworkPolicies ARE enforced out of the box (prove it: apply the default-deny in 15.3 and watch netshoot get refused). Only switch CNI (`--flannel-backend=none --disable-network-policy` + Cilium/Calico) for advanced policy (L7, FQDN), observability (Hubble), or encryption. Know this tradeoff.
 
 ### 13.4 kube-proxy iptables Walk + Klipper-LB + Traefik
 
@@ -208,7 +211,8 @@ kubectl get svc -A
 sudo iptables -t nat -L KUBE-SERVICES -n | head -20
 sudo iptables -t nat -L KUBE-SVC-XXX -n
 ipvsadm -Ln  # if --kube-proxy-arg proxy-mode=ipvs
-kubectl -n kube-system logs -l app=klipper-lb  # one Pod per node binding 80/443 for LoadBalancer Services
+kubectl -n kube-system get ds | grep svclb  # one DaemonSet per LoadBalancer Service, pods named svclb-<svc>-<hash>
+kubectl -n kube-system logs -l svccontroller.k3s.cattle.io/svcname=<svc>  # svclb pods carry NO app=klipper-lb label — this selector is the one that works
 ```
 
 K3s defaults: Traefik Ingress + ServiceLB. You disabled Traefik to learn NGINX — understand both. Traefik reads `Ingress` + `IngressRoute` CRDs; NGINX reads `Ingress` + annotations.
@@ -427,13 +431,17 @@ spec:
   - from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ingress-nginx}}, podSelector: {matchLabels: {app.kubernetes.io/name: ingress-nginx}}}]
     ports: [{port: 8080, protocol: TCP}]
   egress:
-  - to: [{podSelector: {matchLabels: {app: postgres}}}]  # only DB
-    ports: [{port: 5432}]
+  - to: [{podSelector: {matchLabels: {app: postgres}}}]  # one rule per dependency — a policy
+    ports: [{port: 5432}]                               # that omits one backend fails CLOSED.
+  - to: [{podSelector: {matchLabels: {app: redis}}}]     # extend this list for every backend
+    ports: [{port: 6379}]                               # your pods actually call (Part 3 stack
+  - to: [{podSelector: {matchLabels: {app: kafka-kraft}}}]  # needs redis:6379 + kafka:9092/9093 too)
+    ports: [{port: 9092}, {port: 9093}]
   - to: [{namespaceSelector: {}, podSelector: {matchLabels: {k8s-app: kube-dns}}}]  # allow DNS!
     ports: [{port: 53, protocol: UDP}]
 ```
 
-Flannel ignores this — you must switch CNI to Cilium/Calico to enforce. Test with `kubectl run netshoot --rm -it --image=nicolaka/netshoot -- curl postgres:5432`.
+Default K3s enforces all of this via its embedded kube-router NetworkPolicy controller — no CNI switch needed for standard policies (only for L7/FQDN/observability, see 13.3). Test with `kubectl run netshoot --rm -it --image=nicolaka/netshoot -- curl -m 5 postgres:5432`.
 
 ### 15.4 Storage Deep: PV/PVC/StorageClass/CSI/Snapshots
 
@@ -455,6 +463,8 @@ spec:
   volumeSnapshotClassName: csi-snapclass
   source: {persistentVolumeClaimName: data-postgres-0}
 ```
+
+> ⚠ Snapshots need a CSI driver with a snapshotter + VolumeSnapshotClass. K3s's default `local-path-provisioner` has NONE — this manifest fails there. Install Longhorn (or any snapshot-capable CSI) first, then point `volumeSnapshotClassName` at its class.
 
 K3s local-path-provisioner internals: watches PVC -> creates hostPath PV at `/var/lib/rancher/k3s/storage/<pvc>-<rand>`. No capacity enforcement, no multi-node migration. For learning RWX install `nfs-subdir-external-provisioner` or Longhorn (`helm install longhorn`). Backup PVC data: `kubectl cp`, `restic`, Velero.
 
@@ -581,13 +591,13 @@ kubectl get nodes -o wide                 # pod CIDRs
 ping -c3 -s 1400 -M do <remote-pod-ip>    # fails => MTU problem proven
 ip link show flannel.1                    # read the MTU
 ```
-Fix: `--flannel-mtu=1450` (or lower if a corporate VPN stacks more overhead). Write this one in ERRORS.md *before* you need it.
+Fix: there is NO `--flannel-mtu` flag — flannel derives MTU automatically (verify: `grep FLANNEL_MTU /run/flannel/subnet.env`). To lower it: shrink the host interface MTU (flannel follows it), or override via `--flannel-conf` with a `net-conf.json` containing `Backend: {Type: vxlan, MTU: <n>}`. Write this one in ERRORS.md *before* you need it.
 
 **A4. conntrack exhaustion — services die silently at scale.** Every Service connection is a conntrack entry. Table full → new connections drop with no error anywhere. Check: `dmesg | grep -i conntrack`, `/proc/sys/net/netfilter/nf_conntrack_count` vs `nf_conntrack_max`. Raise via sysctl (kubelet `--allowed-unsafe-sysctls` or node tuning). The signature — *some* connections work, others time out, nothing in app logs — should make you think "conntrack" within 30 seconds.
 
 **A5. Read `k3s check-config` like an operator.** It verifies: `br_netfilter` + `bridge-nf-call-iptables=1` (without it, bridge traffic bypasses iptables — the signature: **pods reach pod IPs but not Service VIPs**), `overlay` module, `ip_forward=1`, swap warning. Each failing line maps to a specific failure signature — draw that mapping in NOTES.md; it is a private superpower.
 
-**A6. CoreDNS internals — read the Corefile.** `kubectl -n kube-system get cm coredis -o yaml` (typo-proof: `cm coredns`): the `kubernetes` plugin (service DNS + records), `forward . /etc/resolv.conf` (upstream), `hosts` (node-style overrides), `reload` (live config reload — edit ConfigMap, no restart, watch it apply). Debug loop: CoreDNS logs (`-l k8s-app=kube-dns`) + busybox nslookup from a pod + `dig +trace` if desperate. Know that NodeLocal DNSCache exists and *why* big clusters add it (UDP conntrack pressure + tail latency).
+**A6. CoreDNS internals — read the Corefile.** `kubectl -n kube-system get cm coredns -o yaml`: the `kubernetes` plugin (service DNS + records), `forward . /etc/resolv.conf` (upstream), `hosts` (node-style overrides), `reload` (live config reload — edit ConfigMap, no restart, watch it apply). Debug loop: CoreDNS logs (`-l k8s-app=kube-dns`) + busybox nslookup from a pod + `dig +trace` if desperate. Know that NodeLocal DNSCache exists and *why* big clusters add it (UDP conntrack pressure + tail latency).
 
 **A7. CPU throttling — the invisible performance killer.** CPU limits translate to CFS quota (`cpu.max = 10000 100000` for 100m). Throttled periods stall the app *even when the node is idle*. Detect: `rate(container_cpu_cfs_throttled_periods_total[5m]) / rate(container_cpu_cfs_periods_total[5m]) > 0.05` → raise limit or drop it. JVM + throttling = GC pauses aligned to quota periods = mystery latency spikes. Prod wisdom: many shops set CPU **requests but no limits** for latency-sensitive apps (limits protect noisy neighbors, requests win scheduling) — know both schools and their tradeoffs.
 
@@ -595,7 +605,7 @@ Fix: `--flannel-mtu=1450` (or lower if a corporate VPN stacks more overhead). Wr
 
 ### [B] Operator findings — the K3s-on-WSL curse and the observability mindset
 
-**B1. Certificates and the WSL IP-change curse.** K3s server certs embed SANs (node IP, names). WSL2's NAT network changes the IP on reboot → stale Flannel routes, apiserver cert mismatch, Windows-side kubectl suddenly refused. Mitigations: `--tls-san` for every name/IP you'll ever use to reach it; Win11 `networkingMode=mirrored` in `.wslconfig` for a stable network identity; rotate with `sudo k3s certificate rotate` then restart. Kubeconfig server field: `127.0.0.1` works only *inside* WSL — for Windows kubectl point it at the WSL IP or a tls-san'd hostname. Write the exact recovery sequence in ERRORS.md; you WILL need it.
+**B1. Certificates and the WSL IP-change curse.** K3s server certs embed SANs (node IP, names). WSL2's NAT network changes the IP on reboot → stale Flannel routes, apiserver cert mismatch, Windows-side kubectl suddenly refused. Mitigations: `--tls-san` for every name/IP you'll ever use to reach it; Win11 `networkingMode=mirrored` in `.wslconfig` for a stable network identity; rotate STOPPED (`sudo systemctl stop k3s && sudo k3s certificate rotate && sudo systemctl start k3s` — rotating live can leave missing cert files) then restart. Kubeconfig server field: `127.0.0.1` works only *inside* WSL — for Windows kubectl point it at the WSL IP or a tls-san'd hostname. Write the exact recovery sequence in ERRORS.md; you WILL need it.
 
 **B2. Observability mental models — what to graph and why (this was entirely missing).**
 - **Golden Signals** (Google SRE, per service): latency, traffic, errors, saturation. One dashboard per service from exactly these four.

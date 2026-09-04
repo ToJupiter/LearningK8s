@@ -74,7 +74,8 @@ metadata:
   name: postgres
   namespace: production
 spec:
-  serviceName: postgres
+  serviceName: postgres-headless   # MUST be a headless Service (see below) — a ClusterIP
+                                   # name here schedules fine but per-pod DNS (postgres-0.postgres) never resolves
   replicas: 1
   selector:
     matchLabels:
@@ -124,7 +125,7 @@ spec:
 ```
 
 ```yaml
-# postgres/service.yaml
+# postgres/service.yaml  (client-facing ClusterIP — apps connect here)
 apiVersion: v1
 kind: Service
 metadata:
@@ -137,6 +138,19 @@ spec:
     - port: 5432
       targetPort: 5432
   type: ClusterIP
+---
+# postgres/headless.yaml  (REQUIRED by the StatefulSet above: stable pod DNS + ordered identity)
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+  namespace: production
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+  clusterIP: None
 ```
 
 ### 9.3 Redis Deployment
@@ -238,7 +252,9 @@ KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER
 **Lab A — KRaft combined single-node (your WSL default):**
 
 ```yaml
-# kafka/kraft-combined/configmap.yaml
+# kafka/kraft-combined/configmap.yaml — REFERENCE ONLY. The StatefulSet below is env-configured
+# and this file is intentionally NOT mounted: it documents the equivalent server.properties so you
+# learn the file-based form. (If you mount it AND set env vars, env wins.)
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -319,7 +335,8 @@ spec:
             - containerPort: 9093
           env:
             - name: CLUSTER_ID
-              value: "MkU3OEVBNTcwNTJENDM2Qk"  # generate via: docker run apache/kafka:3.7.0 kafka-storage.sh random-uuid
+              value: "MkU3OEVBNTcwNTJENDM2Qk"  # EXAMPLE value (from upstream docs). Generate your own:
+                                               # docker run --rm --entrypoint kafka-storage.sh apache/kafka:3.7.0 random-uuid
             - name: KAFKA_NODE_ID
               value: "1"
             - name: KAFKA_PROCESS_ROLES
@@ -336,6 +353,13 @@ spec:
               value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
             - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
               value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "1"     # defaults are 3/2 — on a 1-broker lab anything transactional fails without these
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: "1"     # (matches upstream's own single-node example on Docker Hub)
+            - name: KAFKA_LOG_DIRS
+              value: "/var/lib/kafka/data"   # WITHOUT this, data lands on the image default (/tmp/...)
+                                             # and the PVC below is decorative — Exit Exam Q2 would FAIL
             - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
               value: "false"
           volumeMounts:
@@ -482,6 +506,8 @@ data:
     spring.data.redis.host=redis
     spring.data.redis.port=6379
     spring.kafka.bootstrap-servers=kafka:9092
+    server.shutdown=graceful                                # finish in-flight requests on SIGTERM (needs preStop above)
+    spring.lifecycle.timeout-per-shutdown-phase=30s
 ```
 
 ```yaml
@@ -501,6 +527,7 @@ spec:
       labels:
         app: spring-api
     spec:
+      terminationGracePeriodSeconds: 45   # must exceed preStop sleep + Spring shutdown budget (see chain below)
       initContainers:
         - name: wait-for-postgres
           image: busybox:1.36
@@ -511,6 +538,10 @@ spec:
           imagePullPolicy: IfNotPresent   # Critical for local images!
           ports:
             - containerPort: 8080
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "10"]   # bridge the Endpoints-propagation gap (see A5 below)
           env:
             - name: DB_USER
               valueFrom:
@@ -569,7 +600,7 @@ kubectl logs -n production deployment/spring-api -f
 
 ### 10.1 Resource Management: The Foundation of Scale
 
-Kubernetes schedules based on **requests** and limits via **cgroups v2** (on modern systems).
+Kubernetes **schedules** based on **requests**; the kubelet + runtime **enforce** via cgroups (v2 on modern systems). Scheduling and enforcement are separate mechanisms — conflating them hides real failure modes (a pod can be happily scheduled and still OOMKill).
 
 ```yaml
 resources:
@@ -859,7 +890,7 @@ sudo systemctl restart k3s
 | Phase 10.3 NetworkPolicy | `namespaceSelector.matchLabels.name: ingress-nginx` — Kubernetes does NOT auto-label namespaces with `name` | Auto-label is `kubernetes.io/metadata.name`. Fixed; otherwise the policy silently matches nothing and you conclude (wrongly) NetworkPolicy "doesn't work" |
 | Phase 9.3 Redis | Contradiction: `appendonly yes` (persistence) + `emptyDir` volume (erased on every pod restart) = persistence theater | Either add a PVC or drop `appendonly`. For the lab keep emptyDir and *say out loud why the AOF is pointless here* — that sentence is the learning |
 | Phase 9.2 Postgres | `PGDATA` subdirectory is correctly set — but the *reason* was never explained | See A-note below: ext4 `lost+found` makes initdb refuse a mountpoint root. Understand it or it will bite you with a different provisioner |
-| Phase 9.4 | KRaft section already added in a previous audit pass — validated correct (listeners, voters, CLUSTER_ID formatting, headless service for DNS) | Two additions below: consumer-lag ops + durability semantics |
+| Phase 9.4 | KRaft section already added in a previous audit pass — env names, listeners, voters, CLUSTER_ID formatting and headless DNS verified against upstream `apache/kafka` docs | Round-2 verification ADDED three missing env vars: `KAFKA_LOG_DIRS` (without it data lands on the image `/tmp` default and the PVC is decorative — Exit Q2 fails), `KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR/MIN_ISR=1` (defaults 3/2 break on a 1-broker lab; matches upstream's own single-node example). The `server.properties` ConfigMap is now marked reference-only (it was never mounted) |
 
 ### [A] Architect findings — concept chains that had holes
 

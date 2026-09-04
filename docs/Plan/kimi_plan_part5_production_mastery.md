@@ -136,7 +136,7 @@ affinity:
   nodeAffinity:
     requiredDuringSchedulingIgnoredDuringExecution:
       nodeSelectorTerms:
-      - matchExpressions: [{key: nvidia.com.gpu.product, operator: In, values: [NVIDIA-A100-80GB]}]
+        - matchExpressions: [{key: nvidia.com/gpu.product, operator: In, values: [NVIDIA-A100-80GB]}]   # slash, not dots — GFD label is nvidia.com/gpu.product
 ```
 
 Stack: NVIDIA GPU Operator (driver + device-plugin + DCGM exporter DaemonSets) -> `nvidia-smi` in Pod -> NCCL tests. MIG slices one A100 into 7x `1g.5gb` (`nvidia.com/mig-1g.5gb: 1`). Time-slicing shares one GPU across Pods (not for training, ok for inference). MPS for multi-process sharing.
@@ -164,7 +164,7 @@ vLLM/TGI Deployment + HPA on GPU util/custom queue length (KEDA `prometheus` sca
 ### 21.1 Final Project Acceptance Criteria
 
 1. `git clone` fresh -> `make deploy-local` -> all Pods Ready in `production`, Ingress answers `http://api.localdev.me/health`.
-2. `kubectl -n production exec deploy/spring-api -- curl -s postgres:5432` fails gracefully, logs show connection handling (proves NetworkPolicy + error handling).
+2. `kubectl run -it --rm netshoot -n production --image=nicolaka/netshoot -- curl -s -m 5 postgres:5432` gets a TCP connect (proves the NetworkPolicy allow-list) followed by a protocol-level failure (proves the app must handle non-HTTP backends gracefully). NOTE: exec'ing `curl` inside `spring-api` itself does NOT work — the Temurin JRE-alpine image ships no curl (alpine base + JRE only, per upstream docs). Debug from a toolbox pod, never from the app image.
 3. Kill `kafka-0`: topic `orders` survives (PVC retained), consumer resumes from committed offset (proves KRaft + persistence).
 4. `kubectl top` shows no Pod at 95%+ limits; HPA scales `spring-api` 2->4 under `hey -z 60s -c 20` load.
 5. `trivy image` shows 0 CRITICAL, `kube-linter` passes, image runs as non-root read-only.
@@ -226,8 +226,9 @@ Write three more yourself: require `requests`+`limits`, restrict registries to a
 
 **A2. Argo Rollouts — real canary and blue-green.**
 ```yaml
+apiVersion: argoproj.io/v1alpha1   # Rollouts is a CRD — without apiVersion kubectl rejects the file
 kind: Rollout
-metadata: {name: spring-api}
+metadata: {name: spring-api, namespace: production}
 spec:
   strategy:
     canary:
@@ -250,11 +251,12 @@ curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=v1.29.4+k3s1 sh -
 ```
 Skew rules (official): kubelet may lag apiserver by up to 3 minors; kubectl within ±1. Multi-node order: control plane first, then agents, ONE AT A TIME — `kubectl drain`, upgrade, verify pods, `kubectl uncordon`. Pre-upgrade ritual: `k3s etcd-snapshot` / copy `state.db`, read release notes for API removals (the place your manifests' `apiVersion`s go to die). Post-upgrade: `kubectl get nodes` shows new version and every node Ready.
 
-**A5. The full DR drill — the actual final exam of a system manager.** Scripted and timed:
-1. `velero install` on K3s (+ `--use-restic` for PVC contents);
-2. `velero backup create prod-stack --include-namespaces production --include-resources pv,pvc`;
+**A5. The full DR drill — the actual final exam of a system manager.** Scripted and timed. Velero needs object storage — on WSL that means MinIO first (there is no cloud bucket here):
+0. Deploy MinIO from Velero's own examples (`kubectl apply -f https://raw.githubusercontent.com/vmware-tanzu/velero/main/examples/minio/00-minio-deployment.yaml`), create bucket `velero`, write `credentials-velero` (`[default]` + minio keys);
+1. `velero install --provider aws --plugins velero/velero-plugin-for-aws:<version-matching-your-velero> --bucket velero --secret-file ./credentials-velero --use-volume-snapshots=false --use-node-agent --default-volumes-to-fs-backup --backup-location-config region=minio,s3ForcePathStyle="true",s3Url=http://minio.velero.svc:9000` (node-agent = the current File System Backup path; `--use-restic` is deprecated. Match the plugin version to your Velero version!);
+2. `velero backup create prod-stack --include-namespaces production --default-volumes-to-fs-backup --wait` (PVC contents of local-path volumes ride along ONLY via fs-backup — without it you restore perfectly empty PVCs);
 3. Simulate disaster: `kubectl delete ns production` and delete local-path PV dirs;
-4. `velero restore create --from-backup prod-stack --restore-volumes=true`;
+4. `velero restore create --from-backup prod-stack --wait`;
 5. Verify: app serves, Postgres data intact, Kafka topic replayable.
 Un-rehearsed restore time is your real MTTR. "Three copies, two media, one offsite, and one *verified restore*." Git manifests + Velero data + SealedSecrets = a cluster you can lose and rebuild inside an hour. That — not never failing — is what godlike means.
 
@@ -327,6 +329,18 @@ Part 3's acceptance criteria (Phase 21.1) + every Exit Exam + the DR drill, unde
 | 28 | kube-bench / Trivy Operator / who-can; postmortems + error budgets; runbooks | MED | Part 5 |
 | 29 | AI-ops: NCCL_DEBUG, gang deadlock story, checkpoint/resume, HF token hygiene | MED | Part 5 |
 | 30 | Garbled-text artifact in Phase 20.2 removed | FIX | Part 5 |
+| 31 | Exit-143 demo exited 0 as written — replaced with real stop/kill + inspect sequence | FIX | Part 1 |
+| 32 | "K3s replaces kube-proxy" claim corrected (standard upstream kube-proxy); KUBECONFIG note scoped to WSL-side | FIX | Part 1 |
+| 33 | Removed obsolete `version: "3.9"`; documented Compose-v2 `deploy` semantics (limits apply, replicas ignored) | FIX | Part 2 |
+| 34 | node-exporter DaemonSet lacked host mounts (monitored the container, not the node) — full working manifest | HIGH | Part 2 |
+| 35 | Ingress port-80 path impossible on baremetal NodePort — added port-forward + Klipper-LB options | HIGH | Part 2 |
+| 36 | Postgres StatefulSet pointed at ClusterIP service — added headless service | MED | Part 3 |
+| 37 | Kafka: added `KAFKA_LOG_DIRS` (PVC was decorative, Exit Q2 would fail) + txn-log RF/ISR=1; CM marked reference-only | HIGH | Part 3 |
+| 38 | Spring deployment lacked the preStop/graceful-shutdown YAML its own exam demands | HIGH | Part 3 |
+| 39 | `etcd-snapshot` on SQLite (unsupported), `--flannel-mtu` (nonexistent), `cm coredis` typo, klipper selector — corrected | HIGH | Part 4 |
+| 40 | Default K3s DOES enforce NetworkPolicy (embedded kube-router) — CNI-switch claim corrected; egress rules completed | HIGH | Part 4 |
+| 41 | requests→memory.min gated on MemoryQoS (version-nuanced); seccomp ~44/300+ (was inverted) | MED | Part 4 |
+| 42 | GPU label slash, Rollout `apiVersion`, Velero MinIO+node-agent drill, netshoot criterion | HIGH | Part 5 |
 
 The master file `docs/Plan/kimi_plan.md` remains the unsplit reference; these five parts carry the audited, corrected, exam-gated version of the journey.
 

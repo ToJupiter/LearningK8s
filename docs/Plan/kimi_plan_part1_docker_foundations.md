@@ -108,7 +108,7 @@ docker run hello-world
 
 ### 0.4 K3s Installation (The Lightweight Kubernetes)
 
-K3s is a certified Kubernetes distribution. It replaces etcd with SQLite (by default), replaces kube-proxy with a simpler implementation, and uses Flannel for CNI. It's one binary.
+K3s is a certified Kubernetes distribution. It replaces etcd with SQLite (by default, via the Kine shim), keeps the standard upstream kube-proxy for Service routing, and uses Flannel for CNI. It's one binary.
 
 ```bash
 # Install K3s server with specific flags for WSL/resource constraints
@@ -122,7 +122,7 @@ sudo systemctl status k3s
 kubectl get nodes
 ```
 
-**Important K3s on WSL Note:** WSL2's virtual network interface changes IP on restart. For consistent `kubectl` access from Windows, add this to your `~/.bashrc`:
+**Important K3s on WSL Note:** WSL2's virtual network interface changes IP on restart, which can break saved kubeconfig `server:` addresses and serving certs (full story in Part 4, audit B1). For non-root `kubectl` access *inside the WSL distro*, add this to your `~/.bashrc` (this does nothing for kubectl on the Windows side — that needs the WSL IP or a `--tls-san` hostname):
 
 ```bash
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
@@ -526,7 +526,14 @@ docker run --read-only --tmpfs /tmp --tmpfs /var/run nginx:alpine
 ```bash
 docker run --rm alpine nosuchcommand; echo $?        # 127
 docker run --rm -m 50m alpine sh -c 'apk add -q stress && stress --vm 1 --vm-bytes 200m'; echo $?  # 137
-docker run --rm alpine sh -c 'sleep 5'; echo $?      # 143 (SIGTERM path)
+# 143 needs a real SIGTERM — a sleep that finishes on its own exits 0. Do this instead:
+docker run -d --name term-demo alpine sleep 600
+docker stop term-demo                                 # sends SIGTERM, waits, then SIGKILLs if needed
+docker inspect term-demo --format 'ExitCode={{.State.ExitCode}}'  # 143 = SIGTERM honored
+docker rm term-demo
+docker run -d --name kill-demo alpine sleep 600
+docker kill kill-demo; docker inspect kill-demo --format 'ExitCode={{.State.ExitCode}}'  # 137
+docker rm kill-demo
 ```
 Kubernetes reports the same numbers in `kubectl describe pod` (`State: Terminated, Reason: OOMKilled, Exit Code: 137`). Seeing 143 vs 137 tells you instantly whether an app died gracefully or was executed.
 
@@ -570,7 +577,7 @@ Kubernetes reports the same numbers in `kubectl describe pod` (`State: Terminate
 ## Part 1 Exit Exam — pass in front of a blank terminal
 
 1. Start an nginx container; from the HOST alone (no `docker inspect` hints) find its PID, its cgroup file, and its namespace links under `/proc`.
-2. Make `docker stop` return in under 1 second for a `sleep 3600` container. (Hint: signal delivery, exec form vs shell form, PID 1.)
+2. Start `docker run -d --name s alpine sh -c 'sleep 3600'` (shell form on purpose) and make `docker stop s` return in under 1 second. Then explain why plain `docker run -d alpine sleep 3600` (exec form) was already fast. (Hint: signal delivery, exec form vs shell form, PID 1.)
 3. Produce exit codes 0, 1, 127, 137, 143 on demand and explain each in one sentence.
 4. Delete a volume a running container uses; capture the exact error; recover both container and data.
 5. Whiteboard to a rubber duck: image vs layer vs container vs volume vs bind mount vs registry — with arrows.
