@@ -1,0 +1,187 @@
+# MongoDB + HAProxy + Keepalived lab on a single Docker host.
+#
+# Topology (all IPs are fake lab addresses on a private Docker bridge):
+#   mongo1 172.30.77.11   mongo2 172.30.77.12   mongo3 172.30.77.13
+#   health1 172.30.77.21  health2 172.30.77.22  health3 172.30.77.23
+#   proxy1 172.30.77.31 (HAProxy+Keepalived)   proxy2 172.30.77.32 (HAProxy+Keepalived)
+#   VIP 172.30.77.100     client 172.30.77.41
+#
+# Run:  docker compose up -d --build
+# Stop: docker compose down        (keeps MongoDB data volumes)
+# Wipe: docker compose down -v     (DELETES MongoDB data volumes)
+
+name: mongodb-ha-lab
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# Every mongod: replica set member, small cache so three nodes fit in 8 GB WSL.
+x-mongo-common: &mongo-common
+  image: mongo:7.0
+  command:
+    - mongod
+    - --replSet
+    - labrs
+    - --bind_ip_all
+    - --wiredTigerCacheSizeGB
+    - "0.25"
+  restart: unless-stopped
+  init: true
+  stop_grace_period: 30s
+  logging: *default-logging
+  networks:
+    mongo-ha-net:
+
+# Health checker: one HTTP endpoint per mongod that answers
+# "is this node the writable primary?" (200 yes / 503 no).
+x-health-common: &health-common
+  image: mongodb-ha-lab-health:local
+  build:
+    context: ./health
+  restart: unless-stopped
+  init: true
+  logging: *default-logging
+  networks:
+    mongo-ha-net:
+
+# Proxy: HAProxy (primary-aware TCP load balancer) + Keepalived (VRRP VIP owner).
+x-proxy-common: &proxy-common
+  image: mongodb-ha-lab-proxy:local
+  build:
+    context: ./proxy
+  restart: unless-stopped
+  init: true
+  stop_grace_period: 20s
+  cap_add:
+    - NET_ADMIN # assign/remove the VIP
+    - NET_RAW   # send/receive VRRP packets
+  logging: *default-logging
+  networks:
+    mongo-ha-net:
+
+services:
+
+  mongo1:
+    <<: *mongo-common
+    hostname: mongo1
+    volumes:
+      - mongo1_data:/data/db
+    networks:
+      mongo-ha-net:
+        ipv4_address: 172.30.77.11
+
+  mongo2:
+    <<: *mongo-common
+    hostname: mongo2
+    volumes:
+      - mongo2_data:/data/db
+    networks:
+      mongo-ha-net:
+        ipv4_address: 172.30.77.12
+
+  mongo3:
+    <<: *mongo-common
+    hostname: mongo3
+    volumes:
+      - mongo3_data:/data/db
+    networks:
+      mongo-ha-net:
+        ipv4_address: 172.30.77.13
+
+  health1:
+    <<: *health-common
+    hostname: health1
+    environment:
+      MONGO_HOST: mongo1
+      MONGO_PORT: "27017"
+      REPLICA_SET: labrs
+      LISTEN_PORT: "9201"
+      CHECK_TIMEOUT_MS: "1000"
+    depends_on:
+      - mongo1
+    networks:
+      mongo-ha-net:
+        ipv4_address: 172.30.77.21
+
+  health2:
+    <<: *health-common
+    hostname: health2
+    environment:
+      MONGO_HOST: mongo2
+      MONGO_PORT: "27017"
+      REPLICA_SET: labrs
+      LISTEN_PORT: "9201"
+      CHECK_TIMEOUT_MS: "1000"
+    depends_on:
+      - mongo2
+    networks:
+      mongo-ha-net:
+        ipv4_address: 172.30.77.22
+
+  health3:
+    <<: *health-common
+    hostname: health3
+    environment:
+      MONGO_HOST: mongo3
+      MONGO_PORT: "27017"
+      REPLICA_SET: labrs
+      LISTEN_PORT: "9201"
+      CHECK_TIMEOUT_MS: "1000"
+    depends_on:
+      - mongo3
+    networks:
+      mongo-ha-net:
+        ipv4_address: 172.30.77.23
+
+  proxy1:
+    <<: *proxy-common
+    hostname: proxy1
+    environment:
+      PROXY_ID: a # selects /etc/keepalived-a.conf (priority 120)
+    depends_on:
+      - health1
+      - health2
+      - health3
+    networks:
+      mongo-ha-net:
+        ipv4_address: 172.30.77.31
+
+  proxy2:
+    <<: *proxy-common
+    hostname: proxy2
+    environment:
+      PROXY_ID: b # selects /etc/keepalived-b.conf (priority 110)
+    depends_on:
+      - health1
+      - health2
+      - health3
+    networks:
+      mongo-ha-net:
+        ipv4_address: 172.30.77.32
+
+  client:
+    image: mongo:7.0
+    command: ["sleep", "infinity"]
+    hostname: client
+    restart: unless-stopped
+    init: true
+    logging: *default-logging
+    networks:
+      mongo-ha-net:
+        ipv4_address: 172.30.77.41
+
+networks:
+  mongo-ha-net:
+    name: mongo-ha-net
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.77.0/24
+
+volumes:
+  mongo1_data:
+  mongo2_data:
+  mongo3_data:
