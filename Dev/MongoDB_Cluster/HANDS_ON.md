@@ -1582,7 +1582,7 @@ Expected: three `OK` lines.
 ### 3.3 Compare against the reference copy (the real self-test)
 
 ```bash
-diff -ru /home/haiph/K8sLearning/MongoDB_Cluster/docs/lab ~/mongodb-ha-lab
+diff -ru ~/K8sLearning/Dev/MongoDB_Cluster/docs/lab ~/mongodb-ha-lab
 echo "diff exit code: $?"
 ```
 
@@ -1654,7 +1654,7 @@ Run them in order. **Record observations in the worksheet (§W).**
 ## Phase 6 — Air-gap bundle (create on the connected machine)
 
 ```bash
-cd /home/haiph/K8sLearning/MongoDB_Cluster
+cd ~/K8sLearning/Dev/MongoDB_Cluster
 bash docs/offline/build-bundle.sh
 sha256sum -c mongodb-ha-lab-bundle.tar.gz.sha256
 ```

@@ -420,7 +420,7 @@ bash -n scripts/preflight.sh scripts/init-replica.sh \
 docker compose config --quiet && echo "compose OK"
 chmod +x scripts/*.sh proxy/*.sh
 # the real self-test: your typed copy must be byte-identical to the reference
-diff -ru /home/haiph/K8sLearning/MongoDB_Cluster/docs/lab ~/mongodb-ha-lab
+diff -ru ~/K8sLearning/Dev/MongoDB_Cluster/docs/lab ~/mongodb-ha-lab
 echo "diff exit code: $?"   # must be 0
 bash scripts/preflight.sh   # must end with PREFLIGHT OK
 ```
@@ -452,7 +452,7 @@ Docker registry. Everything it runs is in the bundle.
 ## 4.2 Build the bundle (connected host)
 
 ```bash
-cd /path/to/MongoDB_Cluster
+cd ~/K8sLearning/Dev/MongoDB_Cluster
 bash docs/offline/build-bundle.sh
 ```
 
